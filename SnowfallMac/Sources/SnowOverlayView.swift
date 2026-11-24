@@ -50,6 +50,8 @@ private final class SnowPile {
     var lastSurface: SnowSurface
     var fresh: [CGFloat]
     var packed: [CGFloat]
+    var freshDelta: [CGFloat]
+    var packedDelta: [CGFloat]
     var lastSeenAt: TimeInterval
     var pendingMovementX: CGFloat = 0
     var pendingMovementY: CGFloat = 0
@@ -58,8 +60,11 @@ private final class SnowPile {
     init(surface: SnowSurface, binCount: Int, now: TimeInterval) {
         lastFrame = surface.frame
         lastSurface = surface
-        fresh = Array(repeating: 0, count: max(1, binCount))
-        packed = Array(repeating: 0, count: max(1, binCount))
+        let count = max(1, binCount)
+        fresh = Array(repeating: 0, count: count)
+        packed = Array(repeating: 0, count: count)
+        freshDelta = Array(repeating: 0, count: count)
+        packedDelta = Array(repeating: 0, count: count)
         lastSeenAt = now
     }
 
@@ -75,6 +80,8 @@ private final class SnowPile {
         guard count != fresh.count else { return }
         fresh = Self.resample(fresh, to: count)
         packed = Self.resample(packed, to: count)
+        freshDelta = Array(repeating: 0, count: count)
+        packedDelta = Array(repeating: 0, count: count)
     }
 
     private static func resample(_ source: [CGFloat], to count: Int) -> [CGFloat] {
@@ -113,7 +120,7 @@ final class SnowOverlayView: NSView {
     private let screen: NSScreen
     private let binWidth: CGFloat = 4
     private let missingSurfaceGracePeriod: TimeInterval = 1.25
-    private let maximumBurstFlakes = 300
+    private let maximumBurstFlakes = 640
     private var maximumSnowHeight: CGFloat { max(8, intensity.maximumPileHeight) }
     private let baseWindStrength: CGFloat = 150
 
@@ -346,10 +353,21 @@ final class SnowOverlayView: NSView {
         )
     }
 
-    private func spawnPowder(at point: CGPoint, velocity: CGVector, count: Int, sourceSurfaceID: Int?) {
-        guard !flakeSprites.isEmpty else { return }
-        for _ in 0..<count {
-            guard burstFlakes.count < maximumBurstFlakes else { return }
+    @discardableResult
+    private func spawnPowder(
+        at point: CGPoint,
+        velocity: CGVector,
+        count: Int,
+        sourceSurfaceID: Int?,
+        sizeScale: CGFloat = 1
+    ) -> Int {
+        guard !flakeSprites.isEmpty else { return 0 }
+        var spawned = 0
+        let requested = max(0, count)
+        let scale = max(0.75, min(1.75, sizeScale))
+
+        for _ in 0..<requested {
+            guard burstFlakes.count < maximumBurstFlakes else { break }
             let sprite = Int.random(in: 1..<flakeSprites.count)
             burstFlakes.append(Snowflake(
                 position: CGPoint(
@@ -360,7 +378,7 @@ final class SnowOverlayView: NSView {
                     dx: velocity.dx + CGFloat.random(in: -34...34),
                     dy: velocity.dy + CGFloat.random(in: -24...25)
                 ),
-                radius: CGFloat.random(in: 3.2...7.8),
+                radius: min(13, CGFloat.random(in: 3.2...7.8) * scale),
                 alpha: CGFloat.random(in: 0.56...0.94),
                 phase: CGFloat.random(in: 0...(CGFloat.pi * 2)),
                 rotation: CGFloat.random(in: 0...(CGFloat.pi * 2)),
@@ -372,7 +390,9 @@ final class SnowOverlayView: NSView {
                 life: -1, // Dislodged snow persists until it lands on a lower surface or the screen edge.
                 sourceSurfaceID: sourceSurfaceID
             ))
+            spawned += 1
         }
+        return spawned
     }
 
     // MARK: Wind field
@@ -541,49 +561,91 @@ final class SnowOverlayView: NSView {
     }
 
     private func depositSnow(on surface: SnowSurface, x: CGFloat, amount: CGFloat) {
-        guard let pile = piles[surface.id], pile.count > 0 else { return }
+        guard let pile = piles[surface.id], pile.count > 0, amount > 0 else { return }
         let center = pileIndex(for: x, on: surface)
-        // A Gaussian footprint makes each landing form a small rounded pillow.
-        for offset in -3...3 {
+        var overflow: CGFloat = 0
+
+        // A Gaussian footprint makes each landing form a rounded pillow. When
+        // the impact zone is full, spread excess into nearby lower bins rather
+        // than silently dropping the incoming snow.
+        for offset in -4...4 {
             let index = center + offset
             guard index >= 0, index < pile.count else { continue }
-            let weight = exp(-CGFloat(offset * offset) / 4.2)
-            let freshAmount = amount * weight
-            let total = pile.height(at: index)
-            let accepted = min(freshAmount, max(0, maximumSnowHeight - total))
+            let weight = exp(-CGFloat(offset * offset) / 5.2)
+            let requested = amount * weight
+            let room = max(0, maximumSnowHeight - pile.height(at: index))
+            let accepted = min(requested, room)
             pile.fresh[index] += accepted
+            overflow += requested - accepted
+        }
+
+        guard overflow > 0.01, pile.count > 9 else { return }
+        for radius in 5...min(24, pile.count - 1) where overflow > 0.01 {
+            for index in [center - radius, center + radius] where overflow > 0.01 {
+                guard index >= 0, index < pile.count else { continue }
+                let room = max(0, maximumSnowHeight - pile.height(at: index))
+                guard room > 0.01 else { continue }
+                let accepted = min(room, overflow * 0.5)
+                pile.fresh[index] += accepted
+                overflow -= accepted
+            }
         }
     }
 
     private func relaxPile(_ pile: SnowPile, deltaTime: CGFloat) {
         guard pile.count > 2 else { return }
-        let timeScale = max(0, deltaTime * 60)
-        // Avalanche relaxation: transfer only enough snow to keep a natural repose slope.
-        let maxSlope: CGFloat = 1.45
+        let timeScale = min(3, max(0, deltaTime * 60))
+        guard timeScale > 0 else { return }
+
+        // Calculate transfers from one snapshot and apply them together. This
+        // removes the old left-to-right bias and lets compacted snow move on
+        // steep faces instead of becoming permanently immobile.
+        for index in 0..<pile.count {
+            pile.freshDelta[index] = 0
+            pile.packedDelta[index] = 0
+        }
+        let looseReposeSlope: CGFloat = 0.82
+        let packedReposeSlope: CGFloat = 2.15
+
         for index in 0..<(pile.count - 1) {
             let left = pile.height(at: index)
             let right = pile.height(at: index + 1)
             let difference = left - right
-            if difference > maxSlope {
-                let transfer = (difference - maxSlope) * 0.18 * timeScale
-                let loose = min(pile.fresh[index], transfer)
-                pile.fresh[index] -= loose
-                pile.fresh[index + 1] += loose
-            } else if difference < -maxSlope {
-                let transfer = (abs(difference) - maxSlope) * 0.18 * timeScale
-                let loose = min(pile.fresh[index + 1], transfer)
-                pile.fresh[index + 1] -= loose
-                pile.fresh[index] += loose
+            guard abs(difference) > looseReposeSlope else { continue }
+
+            let donor = difference > 0 ? index : index + 1
+            let receiver = difference > 0 ? index + 1 : index
+            let slopeExcess = abs(difference) - looseReposeSlope
+            let looseFlow = min(
+                pile.fresh[donor] * min(0.42, 0.20 * timeScale),
+                slopeExcess * 0.17 * timeScale
+            )
+            if looseFlow > 0 {
+                pile.freshDelta[donor] -= looseFlow
+                pile.freshDelta[receiver] += looseFlow
+            }
+
+            let packedExcess = max(0, abs(difference) - packedReposeSlope)
+            if packedExcess > 0 {
+                let packedFlow = min(
+                    pile.packed[donor] * min(0.12, 0.035 * timeScale),
+                    packedExcess * 0.035 * timeScale
+                )
+                pile.packedDelta[donor] -= packedFlow
+                pile.packedDelta[receiver] += packedFlow
             }
         }
-        // A tiny amount of fresh powder compacts into a denser base over time.
+
         for index in 0..<pile.count {
-            let compaction = min(pile.fresh[index], 0.00035 * timeScale)
+            pile.fresh[index] = max(0, pile.fresh[index] + pile.freshDelta[index])
+            pile.packed[index] = max(0, pile.packed[index] + pile.packedDelta[index])
+            // Deeper fresh snow compacts faster under its own weight.
+            let depthFactor = min(2.2, 0.7 + pile.height(at: index) / 18)
+            let compaction = min(pile.fresh[index], 0.00055 * depthFactor * timeScale)
             pile.fresh[index] -= compaction
             pile.packed[index] += compaction
         }
     }
-
 
     private func spillPileEdges(_ pile: SnowPile, deltaTime dt: CGFloat) {
         guard pile.count > 1, dt > 0 else { return }
@@ -597,27 +659,25 @@ final class SnowOverlayView: NSView {
             let freshSpill = min(pile.fresh[index], overflow * dt * 0.85)
             let packedSpill = min(pile.packed[index], overflow * dt * 0.06)
             let removed = freshSpill + packedSpill
-            guard removed > 0 else { continue }
+            guard removed >= 0.05 else { continue }
 
+            let direction: CGFloat = index == 0 ? -1 : 1
+            let x = index == 0 ? surface.left : surface.right
+            let isDock = surface.ownerName == "Dock"
+            // Give Dock-edge powder enough sideways momentum to clear the rounded lip.
+            let horizontalSpeed: CGFloat = isDock ? 145 : 32
+            let initialFallSpeed: CGFloat = isDock ? -10 : -22
+            let spawned = spawnPowder(
+                at: CGPoint(x: x, y: surface.supportY + edgeHeight * 0.55),
+                velocity: CGVector(dx: direction * horizontalSpeed, dy: initialFallSpeed),
+                count: 1,
+                sourceSurfaceID: surface.id,
+                sizeScale: 1.05
+            )
+            // If the particle budget is full, retain the snow on the ledge.
+            guard spawned > 0 else { continue }
             pile.fresh[index] -= freshSpill
             pile.packed[index] -= packedSpill
-
-            if removed >= 0.05 {
-                let direction: CGFloat = index == 0 ? -1 : 1
-                let x = index == 0 ? surface.left : surface.right
-                let isDock = surface.ownerName == "Dock"
-                // Snow leaving a Dock end must clear the panel's rounded footprint
-                // before dropping; otherwise it can appear suspended beside the Dock
-                // or fall invisibly through the panel onto the screen edge below it.
-                let horizontalSpeed: CGFloat = isDock ? 130 : 25
-                let initialFallSpeed: CGFloat = isDock ? -8 : -20
-                spawnPowder(
-                    at: CGPoint(x: x, y: surface.supportY + edgeHeight * 0.55),
-                    velocity: CGVector(dx: direction * horizontalSpeed, dy: initialFallSpeed),
-                    count: 1,
-                    sourceSurfaceID: surface.id
-                )
-            }
         }
     }
 
@@ -629,23 +689,56 @@ final class SnowOverlayView: NSView {
         ratio: CGFloat
     ) {
         guard ratio > 0 else { return }
-        for index in 0..<pile.count {
-            let height = pile.height(at: index)
-            guard height > 0.12 else { continue }
-            let removedFresh = pile.fresh[index] * ratio
-            let packedRatio: CGFloat = ratio >= 0.999 ? 1 : ratio * 0.46
-            let removedPacked = pile.packed[index] * packedRatio
-            let removed = removedFresh + removedPacked
-            pile.fresh[index] -= removedFresh
-            pile.packed[index] -= removedPacked
-            guard removed > 0.08 else { continue }
 
-            let x = surface.left + (CGFloat(index) + 0.5) * binWidth
-            let y = surface.supportY + height * 0.55
-            let dx = max(-180, min(180, -movementX * 2.5))
-            let dy: CGFloat = -32
-            let count = min(6, max(1, Int(removed / 2.2)))
-            spawnPowder(at: CGPoint(x: x, y: y), velocity: CGVector(dx: dx, dy: dy), count: count, sourceSurfaceID: surface.id)
+        // Shed in spatial clusters. One particle per four-point bin used to
+        // exhaust the cap while most of the removed snow was never rendered.
+        let clusterSize = 12
+        let packedRatio: CGFloat = ratio >= 0.999 ? 1 : ratio * 0.46
+        let dx = max(-210, min(210, -movementX * 2.4))
+        let dy = max(-175, min(105, -movementY * 2.1 - 30))
+
+        for clusterStart in stride(from: 0, to: pile.count, by: clusterSize) {
+            guard burstFlakes.count < maximumBurstFlakes else { break }
+            let clusterEnd = min(pile.count, clusterStart + clusterSize)
+            var removals: [(index: Int, fresh: CGFloat, packed: CGFloat)] = []
+            var totalRemoved: CGFloat = 0
+            var weightedX: CGFloat = 0
+            var weightedY: CGFloat = 0
+
+            for index in clusterStart..<clusterEnd {
+                let height = pile.height(at: index)
+                guard height > 0.12 else { continue }
+                let removedFresh = pile.fresh[index] * ratio
+                let removedPacked = pile.packed[index] * packedRatio
+                let removed = removedFresh + removedPacked
+                guard removed > 0.001 else { continue }
+
+                let x = surface.left + (CGFloat(index) + 0.5) * binWidth
+                let y = surface.supportY + height * 0.55
+                removals.append((index, removedFresh, removedPacked))
+                totalRemoved += removed
+                weightedX += x * removed
+                weightedY += y * removed
+            }
+
+            guard totalRemoved > 0.08, !removals.isEmpty else { continue }
+            let requestedCount = min(5, max(1, Int(ceil(totalRemoved / 2.1))))
+            let spawned = spawnPowder(
+                at: CGPoint(x: weightedX / totalRemoved, y: weightedY / totalRemoved),
+                velocity: CGVector(dx: dx, dy: dy),
+                count: requestedCount,
+                sourceSurfaceID: surface.id,
+                sizeScale: min(1.65, 0.92 + totalRemoved / 42)
+            )
+            guard spawned > 0 else { break }
+
+            // When only part of the cloud fits under the particle cap, only
+            // that fraction leaves the pile. The rest remains visible.
+            let representedRatio = min(1, CGFloat(spawned) / CGFloat(requestedCount))
+            for removal in removals {
+                pile.fresh[removal.index] = max(0, pile.fresh[removal.index] - removal.fresh * representedRatio)
+                pile.packed[removal.index] = max(0, pile.packed[removal.index] - removal.packed * representedRatio)
+            }
         }
     }
 
@@ -669,7 +762,8 @@ final class SnowOverlayView: NSView {
     private func applyMouseInteraction(deltaTime dt: CGFloat) {
         let current = currentMouseLocal()
         defer { previousMouse = current }
-        guard let previous = previousMouse else { return }
+        guard burstFlakes.count < maximumBurstFlakes,
+              let previous = previousMouse else { return }
 
         let dx = current.x - previous.x
         let dy = current.y - previous.y
@@ -699,6 +793,8 @@ final class SnowOverlayView: NSView {
             var particleY: CGFloat = 0
             var particleVelocityX: CGFloat = 0
             var particleVelocityY: CGFloat = 0
+            var removedByBin: [(index: Int, fresh: CGFloat, packed: CGFloat)] = []
+            var surfaceRemovedVolume: CGFloat = 0
             let first = max(0, Int(floor((sweepMinX - surface.left) / binWidth)))
             let last = min(pile.count - 1, Int(floor((sweepMaxX - surface.left) / binWidth)))
             guard first <= last else { continue }
@@ -725,9 +821,11 @@ final class SnowOverlayView: NSView {
                 pile.fresh[index] = max(0, pile.fresh[index] - freshRemoved)
                 pile.packed[index] = max(0, pile.packed[index] - packedRemoved)
                 removedVolume += removed
+                surfaceRemovedVolume += removed
+                removedByBin.append((index, freshRemoved, packedRemoved))
                 changed = true
 
-                if removed > 0.55 {
+                if removed > 0.12 {
                     let side: CGFloat = (dx * (crest.y - current.y) - dy * (crest.x - current.x)) >= 0 ? 1 : -1
                     let swirl = CGVector(dx: -swipeVelocity.dy * side * 0.18, dy: swipeVelocity.dx * side * 0.18)
                     let velocity = CGVector(
@@ -741,14 +839,36 @@ final class SnowOverlayView: NSView {
                     particleVelocityY += velocity.dy * removed
                 }
             }
-            if particleWeight > 1.0 {
+            if particleWeight > 0.12 {
                 let center = CGPoint(x: particleX / particleWeight, y: particleY / particleWeight)
                 let velocity = CGVector(
                     dx: particleVelocityX / particleWeight,
                     dy: particleVelocityY / particleWeight
                 )
-                let particleCount = min(5, max(1, Int(particleWeight / 3.5)))
-                spawnPowder(at: center, velocity: velocity, count: particleCount, sourceSurfaceID: surface.id)
+                let particleCount = min(4, max(1, Int(ceil(particleWeight / 1.7))))
+                let spawned = spawnPowder(
+                    at: center,
+                    velocity: velocity,
+                    count: particleCount,
+                    sourceSurfaceID: surface.id,
+                    sizeScale: min(1.55, 0.86 + particleWeight / 18)
+                )
+                let representedRatio = min(1, CGFloat(spawned) / CGFloat(particleCount))
+                if representedRatio < 1 {
+                    let restoreRatio = 1 - representedRatio
+                    for removal in removedByBin {
+                        pile.fresh[removal.index] += removal.fresh * restoreRatio
+                        pile.packed[removal.index] += removal.packed * restoreRatio
+                    }
+                    removedVolume -= surfaceRemovedVolume * restoreRatio
+                }
+            } else if !removedByBin.isEmpty {
+                // Too little snow for a visible powder particle: keep it on the pile.
+                for removal in removedByBin {
+                    pile.fresh[removal.index] += removal.fresh
+                    pile.packed[removal.index] += removal.packed
+                }
+                removedVolume -= surfaceRemovedVolume
             }
             if changed { relaxPile(pile, deltaTime: dt) }
 
@@ -1099,7 +1219,12 @@ final class SnowOverlayView: NSView {
         for index in range {
             let centerX = startX + (CGFloat(index) + 0.5) * binWidth
             let height = heights[index]
-            let smallRidge = sin(CGFloat(index) * 1.73 + CGFloat(surface.id) * 0.11) * 0.42
+            let seed = CGFloat(surface.id) * 0.11
+            let broadRidge = sin(CGFloat(index) * 0.19 + seed) * 0.72
+            let middleRidge = sin(CGFloat(index) * 0.51 + seed * 1.7) * 0.34
+            let fineRidge = sin(CGFloat(index) * 1.13 + seed * 2.3) * 0.14
+            let ridgeScale = min(1.15, max(0.08, height * 0.10))
+            let smallRidge = (broadRidge + middleRidge + fineRidge) * ridgeScale
             crestPoints.append(CGPoint(x: centerX, y: supportY + height + smallRidge))
         }
         guard let first = crestPoints.first else { return }
