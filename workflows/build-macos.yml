@@ -1,0 +1,101 @@
+name: Build SnowfallMac
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build universal macOS app and validate Metal shader
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Show Xcode version and project configuration
+        run: |
+          xcodebuild -version
+          xcodebuild -list -project SnowfallMac.xcodeproj
+
+      - name: Parse Swift sources
+        run: |
+          set -euo pipefail
+          find SnowfallMac/Sources -name '*.swift' -print0 | while IFS= read -r -d '' file; do
+            echo "Parsing $file"
+            swiftc -frontend -parse "$file"
+          done
+
+      - name: Build for Apple Silicon and Intel
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SnowfallMac.xcodeproj \
+            -scheme SnowfallMac \
+            -configuration Release \
+            -sdk macosx \
+            -derivedDataPath "$RUNNER_TEMP/SnowfallMacDerivedData" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Extract and compile embedded Metal shader
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import textwrap
+
+          source = pathlib.Path("SnowfallMac/Sources/SnowOverlayView.swift").read_text()
+          match = re.search(
+              r'private static let spriteShader = """\n(.*?)\n    """',
+              source,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit("Could not find embedded Metal shader")
+
+          shader = textwrap.dedent(match.group(1)).strip() + "\n"
+          output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "SnowfallParticles.metal"
+          output.write_text(shader)
+          print(f"Wrote {output}")
+          PY
+          xcrun -sdk macosx metal -c \
+            "$RUNNER_TEMP/SnowfallParticles.metal" \
+            -o "$RUNNER_TEMP/SnowfallParticles.air"
+
+      - name: Sign locally and package the app
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/SnowfallMacDerivedData/Build/Products/Release/SnowfallMac.app"
+          test -d "$APP"
+
+          # Ad-hoc signature: no Apple Developer account or signing certificate required.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          echo "Built architectures:"
+          lipo -archs "$APP/Contents/MacOS/SnowfallMac"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP" "$RUNNER_TEMP/SnowfallMac-universal.zip"
+          shasum -a 256 "$RUNNER_TEMP/SnowfallMac-universal.zip" \
+            > "$RUNNER_TEMP/SnowfallMac-universal.zip.sha256"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: SnowfallMac-universal
+          path: |
+            ${{ runner.temp }}/SnowfallMac-universal.zip
+            ${{ runner.temp }}/SnowfallMac-universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
